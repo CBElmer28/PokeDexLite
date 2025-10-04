@@ -6,7 +6,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 const PAGE_LIMIT_KEY = 'PAGE_LIMIT';
 
 export default function Settings() {
-  const options = [10, 20, 50];
+  const options = [10, 20, 50, 100, 151];
   const [selected, setSelected] = useState(20);
 
   useEffect(() => {

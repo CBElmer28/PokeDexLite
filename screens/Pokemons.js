@@ -1,4 +1,3 @@
-// screens/Pokemons.js
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   View,
@@ -7,39 +6,46 @@ import {
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
-  Image,
   TouchableOpacity,
-  TouchableWithoutFeedback,
-  LayoutAnimation,
-  Platform,
-  UIManager,
+  Image,
   TextInput,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useIsFocused } from '@react-navigation/native';
 
 const PAGE_LIMIT_KEY = 'PAGE_LIMIT';
+const LAST_LOADED_KEY = 'LAST_LOADED_COUNT';
 const DEFAULT_LIMIT = 20;
-const OPTIONS = [10, 20, 50];
+const POKE_API = 'https://pokeapi.co/api/v2/pokemon';
 
-if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-  UIManager.setLayoutAnimationEnabledExperimental(true);
+// Constantes de la disposición de la lista
+const ROW_HEIGHT = 72;
+const SEPARATOR_HEIGHT = 1; // borderBottom
+const ITEM_HEIGHT = ROW_HEIGHT + SEPARATOR_HEIGHT;
+const PAGE_SIZE_DEFAULT = DEFAULT_LIMIT;
+
+function getIdFromUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const m = url.match(/\/pokemon\/(\d+)\/?$/);
+  return m ? m[1] : null;
 }
 
 export default function Pokemons({ navigation }) {
+  const isFocused = useIsFocused();
+
   const [pageLimit, setPageLimit] = useState(DEFAULT_LIMIT);
   const [pokemons, setPokemons] = useState([]);
   const [offset, setOffset] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [loadingInitial, setLoadingInitial] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState(null);
 
-  const [settingsOpen, setSettingsOpen] = useState(false);
-
-  // Search state
+  // Estado de busqueda
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const debounceRef = useRef(null);
@@ -47,8 +53,8 @@ export default function Pokemons({ navigation }) {
   const fetchingRef = useRef(false);
   const onEndReachedCalledDuringMomentum = useRef(false);
 
-  // carga el límite desde storage
-  const loadStoredLimit = useCallback(async () => {
+  // Cargar limite persistente y ultimo contador cargado
+  const loadStoredSettings = useCallback(async () => {
     try {
       const v = await AsyncStorage.getItem(PAGE_LIMIT_KEY);
       const n = v ? Number(v) : DEFAULT_LIMIT;
@@ -58,35 +64,38 @@ export default function Pokemons({ navigation }) {
     }
   }, []);
 
-  useEffect(() => { loadStoredLimit(); }, [loadStoredLimit]);
+  const persistLastLoaded = useCallback(async (count) => {
+    try {
+      await AsyncStorage.setItem(LAST_LOADED_KEY, String(count));
+    } catch {
+    }
+  }, []);
 
-  // debounce para la query (300ms)
+  useEffect(() => { loadStoredSettings(); }, [loadStoredSettings]);
+
+  // rebote para input de busqueda (300ms) (osea que al dejar de escribir recien 300ms despues se buscara)
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => setDebouncedQuery(query.trim().toLowerCase()), 300);
     return () => clearTimeout(debounceRef.current);
   }, [query]);
 
-  // fetch principal
-  const fetchPokemons = useCallback(async (params = { reset: false, limitOverride: null }) => {
+  const fetchPokemons = useCallback(async ({ reset = false, givenOffset = null, limitOverride = null } = {}) => {
     if (fetchingRef.current) return;
     fetchingRef.current = true;
 
-    const limit = params.limitOverride ?? pageLimit;
-    const currentOffset = params.reset ? 0 : offset;
+    const limit = limitOverride ?? pageLimit;
+    const currentOffset = givenOffset != null ? givenOffset : (reset ? 0 : offset);
 
     try {
-      if (params.reset) setRefreshing(true);
-      else if (currentOffset === 0) setLoading(true);
+      if (reset) setRefreshing(true);
+      else if (currentOffset === 0) setLoadingInitial(true);
       else setLoadingMore(true);
 
-      const res = await axios.get('https://pokeapi.co/api/v2/pokemon', {
-        params: { limit, offset: currentOffset }
-      });
-
+      const res = await axios.get(POKE_API, { params: { limit, offset: currentOffset } });
       const results = Array.isArray(res.data.results) ? res.data.results : [];
 
-      if (params.reset) {
+      if (reset) {
         setPokemons(results);
         setOffset(limit);
       } else {
@@ -99,130 +108,137 @@ export default function Pokemons({ navigation }) {
       else setHasMore(results.length === limit);
 
       setError(null);
+      // persistencia de contador total cargado
+      const totalLoaded = (reset ? results.length : (pokemons.length + results.length));
+      persistLastLoaded(totalLoaded);
     } catch (err) {
       setError('Error al cargar Pokémons');
     } finally {
-      setLoading(false);
+      setLoadingInitial(false);
       setLoadingMore(false);
       setRefreshing(false);
       fetchingRef.current = false;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offset, pageLimit]);
+  }, [offset, pageLimit, pokemons.length]);
 
-  // carga inicial cuando cambia pageLimit
+  // Carga inicial (y recarga cuando pageLimit cambia)
   useEffect(() => {
     setOffset(0);
     setHasMore(true);
-    fetchPokemons({ reset: true, limitOverride: pageLimit });
+    fetchPokemons({ reset: true, limitOverride: pageLimit, givenOffset: 0 });
   }, [pageLimit]);
 
-  // control de carga adicional
-  const handleLoadMore = () => {
-    if (loadingMore || loading || refreshing || !hasMore) return;
-    if (onEndReachedCalledDuringMomentum.current) return;
-    fetchPokemons({ reset: false });
-    onEndReachedCalledDuringMomentum.current = true;
-  };
+  useEffect(() => {
+    if (!isFocused) return;
+    let mounted = true;
+    (async () => {
+      try {
+        const v = await AsyncStorage.getItem(PAGE_LIMIT_KEY);
+        const n = v ? Number(v) : DEFAULT_LIMIT;
+        const newLimit = n && n > 0 ? n : DEFAULT_LIMIT;
+        if (mounted && newLimit !== pageLimit) setPageLimit(newLimit);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { mounted = false; };
+  }, [isFocused, pageLimit]);
 
   const handleRefresh = () => {
     if (refreshing) return;
-    setOffset(0);
     setHasMore(true);
-    fetchPokemons({ reset: true, limitOverride: pageLimit });
+    fetchPokemons({ reset: true, givenOffset: 0, limitOverride: pageLimit });
   };
 
-  // extractor id robusto
-  const getIdFromUrl = (url) => {
-    if (!url || typeof url !== 'string') return null;
-    const m = url.match(/\/pokemon\/(\d+)\/?$/);
-    return m ? m[1] : null;
+  const handleLoadMore = () => {
+    if (loadingMore || loadingInitial || refreshing || !hasMore) return;
+    if (onEndReachedCalledDuringMomentum.current) return;
+    fetchPokemons({ reset: false, givenOffset: offset });
+    onEndReachedCalledDuringMomentum.current = true;
   };
 
-  // cambiar límite y persistir; aplica inmediatamente
-  const changeLimit = async (newLimit) => {
-    if (newLimit === pageLimit) return;
-    try {
-      await AsyncStorage.setItem(PAGE_LIMIT_KEY, String(newLimit));
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setSettingsOpen(false);
-      setPageLimit(newLimit);
-    } catch {
-      setPageLimit(newLimit);
-    }
-  };
-
-  // filtro local memoizado (filtra por nombre)
+  // Lista filtrada derivada de pokemon + consulta debounced(se menciono previamente) 
   const filteredPokemons = useMemo(() => {
     if (!debouncedQuery) return pokemons;
     return pokemons.filter(p => (p.name || '').toLowerCase().includes(debouncedQuery));
   }, [pokemons, debouncedQuery]);
 
+  const getItemLayout = useCallback((_, index) => ({
+    length: ITEM_HEIGHT,
+    offset: ITEM_HEIGHT * index,
+    index,
+  }), []);
+
   const renderItem = ({ item }) => {
     const id = getIdFromUrl(item.url);
     const imageUrl = id ? `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${id}.png` : null;
-
     return (
       <TouchableOpacity
-        style={styles.card}
-        onPress={() => navigation.navigate('DetallePokemon', { pokemonUrl: item.url })}
+        style={styles.row}
+        onPress={() => navigation && navigation.navigate ? navigation.navigate('DetallePokemon', { pokemonUrl: item.url }) : null}
       >
-        <View style={styles.row}>
-          {imageUrl ? (
-            <Image source={{ uri: imageUrl }} style={styles.avatar} resizeMode="contain" />
-          ) : (
-            <View style={[styles.avatar, styles.noImage]}><Text>—</Text></View>
-          )}
-          <View style={styles.info}>
-            <Text style={styles.name}>{item.name}</Text>
-            <Text style={styles.url}>{item.url}</Text>
-          </View>
+        {imageUrl ? (
+          <Image source={{ uri: imageUrl }} style={styles.avatar} resizeMode="contain" />
+        ) : (
+          <View style={[styles.avatar, styles.noImage]}><Text>—</Text></View>
+        )}
+        <View style={styles.info}>
+          <Text style={styles.name}>{item.name}</Text>
+          <Text style={styles.url}>{item.url}</Text>
         </View>
       </TouchableOpacity>
     );
   };
 
-  const renderFooter = () => loadingMore ? (
-    <View style={styles.footer}><ActivityIndicator size="small" /></View>
-  ) : null;
-
-  const ListEmpty = () => (
-    <View style={styles.center}>
-      {loading ? <ActivityIndicator size="large" /> : <Text>No hay Pokémons.</Text>}
+  const listFooter = () => (
+    <View style={styles.footerContainer}>
+      {loadingMore ? (
+        // ActivityIndicator para carga incremental
+        <ActivityIndicator size="small" color="#1976d2" />
+      ) : null}
+      <Text style={styles.counterText}>Mostrados: {pokemons.length} / {hasMore ? 'más disponibles' : pokemons.length}</Text>
     </View>
   );
 
+  const listEmpty = () => {
+    if (loadingInitial) {
+      // ActivityIndicator para carga inicial (más prominente)
+      return (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color="#1976d2" />
+        </View>
+      );
+    }
+    if (error) {
+      return (
+        <View style={styles.center}>
+          <Text style={styles.error}>{error}</Text>
+          <TouchableOpacity style={styles.retryButton} onPress={() => fetchPokemons({ reset: true, givenOffset: 0, limitOverride: pageLimit })}>
+            <Text style={styles.retryText}>Reintentar</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    return (
+      <View style={styles.center}>
+        <Text>No hay Pokémons.</Text>
+      </View>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      {/* Settings colapsable en la parte superior */}
-      <View style={styles.settingsContainer}>
-        <TouchableWithoutFeedback onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setSettingsOpen(v => !v); }}>
-          <View style={styles.settingsHeader}>
-            <Text style={styles.settingsTitle}>Settings</Text>
-            <Text style={styles.settingsSubtitle}>Pokémon por página: {pageLimit}</Text>
-          </View>
-        </TouchableWithoutFeedback>
+      <View style={styles.headerRow}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>PokeDex Lite</Text>
+          <Text style={styles.subtitle}>{pageLimit} Pokémon por carga</Text>
+        </View>
 
-        {settingsOpen && (
-          <View style={styles.settingsBody}>
-            <Text style={styles.settingsLabel}>Selecciona el número de Pokémon por página</Text>
-            <View style={styles.optionsRow}>
-              {OPTIONS.map(opt => (
-                <TouchableOpacity
-                  key={opt}
-                  style={[styles.option, pageLimit === opt && styles.optionSelected]}
-                  onPress={() => changeLimit(opt)}
-                >
-                  <Text style={[styles.optionText, pageLimit === opt && styles.optionTextSelected]}>{opt}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-            <Text style={styles.settingsNote}>El cambio se aplica inmediatamente y recarga la lista.</Text>
-          </View>
-        )}
+        <TouchableOpacity style={styles.settingsButton} onPress={() => navigation.navigate('Settings')}>
+          <Text style={styles.settingsButtonText}>Configuraciones</Text>
+        </TouchableOpacity>
       </View>
 
-      {/* Barra de búsqueda */}
       <View style={styles.searchContainer}>
         <TextInput
           placeholder="Buscar por nombre..."
@@ -233,62 +249,55 @@ export default function Pokemons({ navigation }) {
           autoCorrect={false}
           clearButtonMode="while-editing"
         />
-        {debouncedQuery ? <Text style={styles.searchCount}>Mostrando {filteredPokemons.length} de {pokemons.length}</Text> : null}
+        <Text style={styles.searchCount}>{debouncedQuery ? `Mostrando ${filteredPokemons.length} de ${pokemons.length}` : ''}</Text>
       </View>
 
       <FlatList
         data={filteredPokemons}
-        keyExtractor={(item, idx) => (item.name ? item.name : `p-${idx}`)}
+        keyExtractor={(item, idx) => (getIdFromUrl(item.url) || `p-${idx}`).toString()}
         renderItem={renderItem}
-        contentContainerStyle={styles.contentContainer}
-        style={styles.list}
         onEndReached={handleLoadMore}
-        onEndReachedThreshold={0.8}
-        ListFooterComponent={renderFooter}
-        ListEmptyComponent={ListEmpty}
+        onEndReachedThreshold={Platform.OS === 'web' ? 0.25 : 0.5}
+        ListFooterComponent={listFooter}
+        ListEmptyComponent={listEmpty}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
-        initialNumToRender={pageLimit}
-        removeClippedSubviews={true}
-        nestedScrollEnabled={false}
+        initialNumToRender={Math.min(10, pageLimit)}
+        getItemLayout={getItemLayout}
         showsVerticalScrollIndicator={true}
         onMomentumScrollBegin={() => { onEndReachedCalledDuringMomentum.current = false; }}
+        contentContainerStyle={pokemons.length === 0 ? styles.flatEmpty : undefined}
       />
     </SafeAreaView>
   );
 }
 
+//Estilos
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff' },
+  headerRow: { padding: 12, borderBottomWidth: 1, borderBottomColor: '#eee', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  title: { fontSize: 20, fontWeight: '700' },
+  subtitle: { fontSize: 12, color: '#666', marginTop: 4 },
+  settingsButton: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#1976d2', borderRadius: 6 },
+  settingsButtonText: { color: '#fff', fontWeight: '600' },
 
-  /* Settings */
-  settingsContainer: { padding: 8, borderBottomWidth: 1, borderColor: '#eee', backgroundColor: '#fafafa' },
-  settingsHeader: { paddingVertical: 8, paddingHorizontal: 4 },
-  settingsTitle: { fontSize: 16, fontWeight: '700' },
-  settingsSubtitle: { fontSize: 12, color: '#666', marginTop: 4 },
-  settingsBody: { marginTop: 8, paddingBottom: 8 },
-  settingsLabel: { fontSize: 13, color: '#333', marginBottom: 8 },
-  optionsRow: { flexDirection: 'row', alignItems: 'center' },
-  option: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, borderWidth: 1, borderColor: '#ddd', marginRight: 8 },
-  optionSelected: { backgroundColor: '#007AFF', borderColor: '#007AFF' },
-  optionText: { fontSize: 14, color: '#222' },
-  optionTextSelected: { color: '#fff', fontWeight: '600' },
-  settingsNote: { marginTop: 8, color: '#666', fontSize: 12 },
-
-  /* Search */
-  searchContainer: { padding: 8, borderBottomWidth: 1, borderColor: '#eee', backgroundColor: '#fff' },
-  searchInput: { backgroundColor: '#f0f0f0', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
+  searchContainer: { paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+  searchInput: { backgroundColor: '#fafafa', padding: 8, borderRadius: 8, borderWidth: 1, borderColor: '#eee' },
   searchCount: { marginTop: 6, fontSize: 12, color: '#666' },
 
-  list: { flex: 1 },
-  contentContainer: { padding: 8 },
+  row: { height: ROW_HEIGHT, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, borderBottomWidth: SEPARATOR_HEIGHT, borderBottomColor: '#f5f5f5', backgroundColor: '#fff' },
+  avatar: { width: 52, height: 52, marginRight: 12 },
+  noImage: { alignItems: 'center', justifyContent: 'center', backgroundColor: '#f0f0f0' },
+  info: { flex: 1, justifyContent: 'center' },
+  name: { fontSize: 16, fontWeight: '600', textTransform: 'capitalize' },
+  url: { fontSize: 11, color: '#666', marginTop: 4 },
 
-  card: { backgroundColor: '#f8f8f8', padding: 12, marginVertical: 6, marginHorizontal: 4, borderRadius: 8 },
-  row: { flexDirection: 'row', alignItems: 'center' },
-  avatar: { width: 72, height: 72, marginRight: 12, backgroundColor: '#fff', borderRadius: 8 },
-  noImage: { alignItems: 'center', justifyContent: 'center', backgroundColor: '#eee' },
-  info: { flex: 1 },
-  name: { fontWeight: 'bold', fontSize: 16, textTransform: 'capitalize' },
-  url: { color: '#666', marginTop: 4, fontSize: 12 },
-  footer: { paddingVertical: 12, alignItems: 'center' },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 20 }
+  footerContainer: { padding: 12, alignItems: 'center', justifyContent: 'center' },
+  counterText: { marginTop: 8, fontSize: 12, color: '#444' },
+
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 20 },
+  error: { color: 'crimson', marginBottom: 12 },
+  retryButton: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#1976d2', borderRadius: 6 },
+  retryText: { color: '#fff' },
+
+  flatEmpty: { flexGrow: 1 },
 });
